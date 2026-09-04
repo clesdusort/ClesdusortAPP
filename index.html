@@ -2457,14 +2457,14 @@ document.getElementById("btnImportPaiements").addEventListener("click", async ()
       const email = normalize(p.email || "");
       if(!email){ nbIgnores++; detailIgnores.push("Entrée sans email, ignorée."); return; }
 
-      // On ne cible que les lettres Mensuelle "Prévisionnel" de ce mois précis, dont l'email
-      // du consultant correspond — jamais une lettre déjà résolue. Si plusieurs fiches partagent
-      // le même email (ex. plusieurs cadeaux souscrits par la même personne), on applique le
-      // même résultat à toutes celles concernées par ce mois, plutôt que de risquer d'en oublier une.
+      // On cible les lettres Mensuelle de ce mois précis, encore NON confirmées comme payées
+      // ("Prévisionnel" = jamais encore tentée, ou "Paiement refusé" = tentée puis échouée,
+      // par exemple si la cliente règle après coup) — jamais une lettre déjà "À faire" ou plus
+      // avancée, pour ne jamais écraser un travail déjà en cours.
       const lettresConcernees = files.lettres.rows.filter(r => {
         if(normalize(r.TYPE_GUIDANCE) !== normalize("Guidance Mensuelle")) return false;
         if(r.MOIS !== mois || r.ANNÉE !== annee) return false;
-        if(r.STATUT !== "Prévisionnel") return false;
+        if(r.STATUT !== "Prévisionnel" && r.STATUT !== "Paiement refusé") return false;
         const c = files.consultants.rows.find(cc => cc.ID === r.ID_CONSULTANT);
         return c && normalize(c.MAIL) === email;
       });
@@ -2489,6 +2489,10 @@ document.getElementById("btnImportPaiements").addEventListener("click", async ()
           nbPayes++;
         } else {
           lettre.STATUT = "Paiement refusé";
+          // ⚠️ DATE_DERNIER_PAIEMENT n'est PAS touchée ici (elle ne reflète que le dernier
+          // paiement RÉUSSI) — mais DATE_PROCHAIN_RENOUVELLEMENT avance quand même : la prochaine
+          // tentative aura bien lieu le mois suivant, qu'elle ait échoué ou non ce mois-ci.
+          if(c && p.prochain_prelevement) c.DATE_PROCHAIN_RENOUVELLEMENT = p.prochain_prelevement;
           nbEchoues++;
 
           // 3 échecs consécutifs (parmi les mois déjà résolus, "Prévisionnel" exclu) -> désactivation automatique.
