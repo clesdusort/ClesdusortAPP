@@ -144,6 +144,7 @@
         <button id="btnStartLetter">Démarrer une lettre →</button>
         <button class="secondary" id="btnImportProspects">⬇️ Importer nouveaux prospects (CSV)</button>
         <button class="secondary" id="btnImportPaiements">🔄 Importer statut paiements</button>
+        <button class="secondary" id="btnArchiverFactures">📁 Archiver les factures</button>
       </div>
     </div>
 
@@ -709,6 +710,11 @@ async function writeCsvFile(name, headers, rows){
 }
 async function ensureSubfolder(name){
   return await dirHandle.getDirectoryHandle(name, {create:true});
+}
+// Variante imbriquée : crée/ouvre un sous-dossier À L'INTÉRIEUR d'un dossier déjà obtenu
+// (ex. "2026" puis "Factures Décembre" dans "2026") — utilisée pour l'archivage des factures.
+async function ensureSubfolderIn(parentHandle, name){
+  return await parentHandle.getDirectoryHandle(name, {create:true});
 }
 // Charge une image depuis le dossier "Uploader" par son nom de base (sans extension), en
 // essayant les extensions courantes puis, en dernier recours, une correspondance tolérante
@@ -2524,6 +2530,77 @@ document.getElementById("btnImportPaiements").addEventListener("click", async ()
     if(e.name !== "AbortError" && e.name !== "InvalidStateError" && !/state had changed/i.test(e.message||"")){
       alert("Erreur d'import : " + e.message);
     }
+  }
+});
+
+/* ---------- Archivage automatique des factures ----------
+   Va chercher, via une connexion réseau, toutes les factures générées depuis le dernier
+   archivage (stockées temporairement côté serveur), et les range dans Année/Factures Mois/.
+   Une fois bien enregistrées sur le disque, confirme au serveur qu'elles peuvent être
+   oubliées — jamais re-téléchargées deux fois. */
+document.getElementById("btnArchiverFactures").addEventListener("click", async () => {
+  const btn = document.getElementById("btnArchiverFactures");
+  const texteOriginal = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "⏳ Archivage en cours...";
+
+  try {
+    const res = await fetch("https://cles-du-sort-paiement.vercel.app/api/factures-en-attente");
+    const data = await res.json();
+    if (!res.ok) { throw new Error(data.error || "Erreur inconnue"); }
+
+    const factures = data.factures || [];
+    if (factures.length === 0) {
+      alert("Aucune nouvelle facture à archiver — tout est déjà à jour.");
+      return;
+    }
+
+    const archiveesAvecSucces = [];
+    const echecs = [];
+
+    for (const facture of factures) {
+      try {
+        const dirAnnee = await ensureSubfolder(String(facture.annee));
+        const dirMois = await ensureSubfolderIn(dirAnnee, "Factures " + facture.mois);
+
+        // Décodage base64 -> octets bruts du PDF
+        const binaire = atob(facture.pdfBase64);
+        const octets = new Uint8Array(binaire.length);
+        for (let i = 0; i < binaire.length; i++) { octets[i] = binaire.charCodeAt(i); }
+
+        const fileHandle = await dirMois.getFileHandle(`Facture_${facture.invoiceNumber}.pdf`, { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(octets);
+        await writable.close();
+
+        archiveesAvecSucces.push(facture.invoiceNumber);
+      } catch (errUneFacture) {
+        console.error(`Erreur d'archivage pour ${facture.invoiceNumber} :`, errUneFacture);
+        echecs.push(facture.invoiceNumber);
+      }
+    }
+
+    // On ne confirme au serveur QUE les factures réellement bien enregistrées sur le disque —
+    // celles en échec restent en attente, pour être retentées au prochain archivage.
+    if (archiveesAvecSucces.length > 0) {
+      await fetch("https://cles-du-sort-paiement.vercel.app/api/confirmer-archivage", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ invoiceNumbers: archiveesAvecSucces }),
+      });
+    }
+
+    let message = `✅ ${archiveesAvecSucces.length} facture(s) archivée(s) avec succès.`;
+    if (echecs.length > 0) {
+      message += `\n⚠️ ${echecs.length} facture(s) n'ont pas pu être enregistrées, elles seront retentées la prochaine fois : ${echecs.join(", ")}`;
+    }
+    alert(message);
+
+  } catch (e) {
+    alert("Erreur lors de l'archivage : " + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = texteOriginal;
   }
 });
 
