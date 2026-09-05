@@ -2560,15 +2560,24 @@ document.getElementById("btnArchiverFactures").addEventListener("click", async (
 
     for (const facture of factures) {
       try {
-        const dirAnnee = await ensureSubfolder(String(facture.annee));
-        const dirMois = await ensureSubfolderIn(dirAnnee, "Factures " + facture.mois);
+        // Arborescence : Factures / Année / Mois /
+        const dirFactures = await ensureSubfolder("Factures");
+        const dirAnnee = await ensureSubfolderIn(dirFactures, String(facture.annee));
+        const dirMois = await ensureSubfolderIn(dirAnnee, facture.mois);
 
         // Décodage base64 -> octets bruts du PDF
         const binaire = atob(facture.pdfBase64);
         const octets = new Uint8Array(binaire.length);
         for (let i = 0; i < binaire.length; i++) { octets[i] = binaire.charCodeAt(i); }
 
-        const fileHandle = await dirMois.getFileHandle(`Facture_${facture.invoiceNumber}.pdf`, { create: true });
+        // Nom de fichier : numéro de facture + nom du client, pour retrouver rapidement
+        // une facture sans avoir à toutes les ouvrir. Caractères interdits dans un nom de
+        // fichier (\ / : * ? " < > |) retirés par sécurité.
+        const nomClientSur = (facture.clientNom || "").replace(/[\\/:*?"<>|]/g, "").trim().replace(/\s+/g, "_");
+        const suffixeNom = nomClientSur ? `_${nomClientSur}` : "";
+        const nomFichier = `Facture_${facture.invoiceNumber}${suffixeNom}.pdf`;
+
+        const fileHandle = await dirMois.getFileHandle(nomFichier, { create: true });
         const writable = await fileHandle.createWritable();
         await writable.write(octets);
         await writable.close();
