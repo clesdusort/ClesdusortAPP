@@ -144,7 +144,6 @@
         <button id="btnStartLetter">Démarrer une lettre →</button>
         <button class="secondary" id="btnImportProspects">⬇️ Importer nouveaux prospects (CSV)</button>
         <button class="secondary" id="btnImportPaiements">🔄 Importer statut paiements</button>
-        <button class="secondary" id="btnArchiverFactures">📁 Archiver les factures</button>
       </div>
     </div>
 
@@ -236,6 +235,37 @@
         <button class="secondary" id="btnVoirStock">📦 Pilotage du stock</button>
         <button class="secondary" id="btnVoirClients">👥 Base clients</button>
         <button class="secondary" id="btnAddConsultant">➕ Ajouter un consultant manuellement</button>
+      </div>
+    </div>
+
+    <div class="step-group">
+      <div class="step-head"><span class="step-num">6</span><span class="step-title">Paiement</span></div>
+      <p class="step-desc">Archivage des factures et suivi du chiffre d'affaires réellement encaissé, pour ta déclaration URSSAF.</p>
+      <div class="step-body">
+        <button class="secondary" id="btnArchiverFactures">📁 Archiver les factures</button>
+      </div>
+      <div style="margin-top:20px; margin-left:35px; max-width:420px; display:flex; gap:14px; flex-wrap:wrap; align-items:flex-end;">
+        <div>
+          <label for="selMoisUrssaf">Mois à déclarer</label>
+          <select id="selMoisUrssaf">
+            <option value="0">Janvier</option><option value="1">Février</option><option value="2">Mars</option>
+            <option value="3">Avril</option><option value="4">Mai</option><option value="5">Juin</option>
+            <option value="6">Juillet</option><option value="7">Août</option><option value="8">Septembre</option>
+            <option value="9">Octobre</option><option value="10">Novembre</option><option value="11">Décembre</option>
+          </select>
+        </div>
+        <div>
+          <label for="inputAnneeUrssaf">Année</label>
+          <input type="number" id="inputAnneeUrssaf" value="2026" min="2020" max="2100" style="width:100px;">
+        </div>
+      </div>
+      <div class="step-body" style="margin-top:14px;">
+        <button class="secondary" id="btnCalculerUrssaf">💶 Calculer le CA encaissé</button>
+      </div>
+      <div id="resultatUrssaf" style="margin-left:35px; margin-top:16px; display:none; background:var(--paper); border:1px solid var(--line); border-radius:var(--r-md); padding:18px; max-width:440px;">
+        <p style="margin:0 0 8px; font-size:14.5px;">Chiffre d'affaires encaissé sur la période : <strong id="urssafCA">—</strong></p>
+        <p style="margin:0; font-size:14.5px; color:#a3221f;">Montant provisoire à payer à l'URSSAF (≈ 21,4 %) : <strong id="urssafAPayer">—</strong></p>
+        <p style="margin:10px 0 0; font-size:12px; color:#777;">⚠️ Estimation provisoire, à confirmer par ton comptable — taux composé de tes cotisations sociales BNC réduites ACRE (19,2 %) + versement libératoire (2,2 %).</p>
       </div>
     </div>
 
@@ -2607,6 +2637,72 @@ document.getElementById("btnArchiverFactures").addEventListener("click", async (
 
   } catch (e) {
     alert("Erreur lors de l'archivage : " + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = texteOriginal;
+  }
+});
+
+/* ---------- Suivi URSSAF : CA réellement encaissé + montant provisoire à payer ----------
+   Va chercher les vrais reversements Stancer (virements Stancer -> compte bancaire), filtre
+   ceux dont la date de reversement tombe dans le mois/année choisi, additionne les montants,
+   et affiche une estimation provisoire du prélèvement URSSAF correspondant.
+   ⚠️ Taux à confirmer par le comptable de Carole : 19,2 % (cotisations BNC 25,6 % réduites
+   ACRE 25 %, immatriculation après le 1er juillet 2026) + 2,2 % (versement libératoire) = 21,4 %. */
+const TAUX_URSSAF_PROVISOIRE = 0.214;
+
+document.getElementById("btnCalculerUrssaf").addEventListener("click", async () => {
+  const btn = document.getElementById("btnCalculerUrssaf");
+  const texteOriginal = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "⏳ Calcul en cours...";
+
+  try {
+    const moisChoisi = parseInt(document.getElementById("selMoisUrssaf").value, 10);
+    const anneeChoisie = parseInt(document.getElementById("inputAnneeUrssaf").value, 10);
+
+    const res = await fetch("https://cles-du-sort-paiement.vercel.app/api/reversements");
+    const data = await res.json();
+    if (!res.ok) { throw new Error(data.error || "Erreur inconnue"); }
+
+    const payouts = data.payouts || [];
+
+    // ⚠️ Champs supposés d'après la doc export CSV Stancer (date_bank, amount) — jamais
+    // encore vérifiés avec un vrai reversement. À ajuster ici si les vrais noms diffèrent.
+    // Par cohérence avec les autres objets Stancer déjà observés (ex. created_at des
+    // paiements), on suppose que date_bank est un timestamp Unix en secondes ; on prévoit
+    // un repli sur une chaîne de date classique si ce n'est pas le cas.
+    function parseDateStancer(valeur) {
+      if (!valeur) return null;
+      if (typeof valeur === "number") return new Date(valeur * 1000);
+      const d = new Date(valeur);
+      return isNaN(d.getTime()) ? null : d;
+    }
+
+    const payoutsDeLaPeriode = payouts.filter((p) => {
+      const d = parseDateStancer(p.date_bank || p.date);
+      if (!d) return false;
+      return d.getMonth() === moisChoisi && d.getFullYear() === anneeChoisie;
+    });
+
+    const totalCentimes = payoutsDeLaPeriode.reduce((somme, p) => {
+      const montant = p.amount ?? p.total_paiements ?? p.montant ?? 0;
+      return somme + montant;
+    }, 0);
+
+    const caEncaisse = totalCentimes / 100;
+    const aPayer = caEncaisse * TAUX_URSSAF_PROVISOIRE;
+
+    document.getElementById("urssafCA").textContent = caEncaisse.toFixed(2).replace(".", ",") + " €";
+    document.getElementById("urssafAPayer").textContent = aPayer.toFixed(2).replace(".", ",") + " €";
+    document.getElementById("resultatUrssaf").style.display = "block";
+
+    if (payoutsDeLaPeriode.length === 0) {
+      alert("Aucun reversement trouvé pour cette période. Soit rien n'est encore arrivé sur ton compte pour ce mois, soit les noms de champs Stancer sont différents de ce qu'on a supposé (à vérifier dès qu'un vrai reversement existe).");
+    }
+
+  } catch (e) {
+    alert("Erreur lors du calcul : " + e.message);
   } finally {
     btn.disabled = false;
     btn.textContent = texteOriginal;
