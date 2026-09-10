@@ -326,8 +326,8 @@
     <h2>Modifier le consultant</h2>
     <p class="small" id="editClientId"></p>
     <label>Statut</label>
-    <select id="editStatut"><option>Actif</option><option>Inactif</option><option value="Inactif technique" disabled>Inactif technique (géré automatiquement par l'app)</option></select>
-    <p class="small" style="opacity:0.6;">« Inactif technique » ne peut être choisi qu'automatiquement par l'app (prestations ponctuelles soldées) — non sélectionnable manuellement ici.</p>
+    <select id="editStatut"><option>Actif</option><option>Résiliation demandée</option><option>Inactif</option><option value="Inactif technique" disabled>Inactif technique (géré automatiquement par l'app)</option></select>
+    <p class="small" style="opacity:0.6;">« Résiliation demandée » : la cliente a demandé à arrêter, mais son mois en cours reste dû (CGV) — bascule automatiquement en « Inactif » une fois ce dernier prélèvement confirmé (payé ou refusé). « Inactif technique » ne peut être choisi qu'automatiquement par l'app (prestations ponctuelles soldées) — non sélectionnable manuellement ici.</p>
     <div class="grid2">
       <div><label>Prénom *</label><input type="text" id="editPrenom"></div>
       <div><label>Nom *</label><input type="text" id="editNom"></div>
@@ -919,7 +919,12 @@ async function initialiserLettresDuMois(){
     const anneeCible = String(refDate.getFullYear());
 
     files.consultants.rows.forEach(c => {
-      if(normalize(c.STATUT_CLIENT) !== normalize("Actif")) return;
+      const statutC = normalize(c.STATUT_CLIENT);
+      // "Résiliation demandée" : la cliente a prévenu qu'elle arrête, mais le mois en cours
+      // reste dû (CGV Article 7) — on continue donc à la traiter, MAIS uniquement pour le mois
+      // en cours (decalageMois===0), jamais pour anticiper les mois suivants qui n'auront pas lieu.
+      if(statutC !== normalize("Actif") && statutC !== normalize("Résiliation demandée")) return;
+      if(statutC === normalize("Résiliation demandée") && decalageMois !== 0) return;
       const prestations = (c.PRESTATIONS_SOUSCRITES || "").split(",").map(s=>normalize(s));
 
       // Guidance Mensuelle : une lettre chaque mois, à partir du mois où le consultant devient
@@ -1284,7 +1289,7 @@ document.getElementById("btnStartLetter").addEventListener("click", () => {
   const sel = document.getElementById("selConsultant");
   sel.innerHTML = "";
   files.consultants.rows
-    .filter(r => normalize(r.STATUT_CLIENT) === normalize("Actif") && idsDus.has((r.ID||"").toString().trim()))
+    .filter(r => (normalize(r.STATUT_CLIENT) === normalize("Actif") || normalize(r.STATUT_CLIENT) === normalize("Résiliation demandée")) && idsDus.has((r.ID||"").toString().trim()))
     .forEach(r => {
       const opt = document.createElement("option");
       opt.value = r.ID;
@@ -2485,9 +2490,10 @@ document.getElementById("btnImportPaiements").addEventListener("click", async ()
     const annee = String(data.annee);
     const paiements = Array.isArray(data.paiements) ? data.paiements : [];
 
-    let nbPayes = 0, nbEchoues = 0, nbDesactives = 0, nbIgnores = 0;
+    let nbPayes = 0, nbEchoues = 0, nbDesactives = 0, nbIgnores = 0, nbResiliationsFinalisees = 0;
     const detailIgnores = [];
     const consultantsDesactives = [];
+    const consultantsResiliationsFinalisees = [];
 
     paiements.forEach(p => {
       const email = normalize(p.email || "");
@@ -2539,6 +2545,16 @@ document.getElementById("btnImportPaiements").addEventListener("click", async ()
             consultantsDesactives.push(c["PRÉNOM NOM"] || c.ID);
           }
         }
+
+        // ⚠️ "Résiliation demandée" : ce mois était le dernier dû (CGV Article 7). Que le
+        // prélèvement ait réussi ou échoué, il n'y a plus rien à retenter derrière — on
+        // finalise directement en "Inactif", sans attendre 3 échecs (logique sans rapport ici).
+        if(c && normalize(c.STATUT_CLIENT) === normalize("Résiliation demandée")){
+          c.STATUT_CLIENT = "Inactif";
+          if(!c.DATE_DÉSINSCRIPTION) c.DATE_DÉSINSCRIPTION = new Date().toLocaleDateString("fr-FR");
+          nbResiliationsFinalisees++;
+          consultantsResiliationsFinalisees.push(c["PRÉNOM NOM"] || c.ID);
+        }
       });
     });
 
@@ -2549,7 +2565,8 @@ document.getElementById("btnImportPaiements").addEventListener("click", async ()
       + `✅ ${nbPayes} lettre(s) confirmée(s) payée(s) → "À faire"\n`
       + `❌ ${nbEchoues} lettre(s) en échec → "Paiement refusé"`
       + (nbIgnores>0 ? `\n⚠️ ${nbIgnores} entrée(s) ignorée(s) (aucune correspondance trouvée)` : "")
-      + (nbDesactives>0 ? `\n\n🔴 ${nbDesactives} consultant(s) désactivé(s) automatiquement (3 échecs consécutifs) : ${consultantsDesactives.join(", ")}` : "");
+      + (nbDesactives>0 ? `\n\n🔴 ${nbDesactives} consultant(s) désactivé(s) automatiquement (3 échecs consécutifs) : ${consultantsDesactives.join(", ")}` : "")
+      + (nbResiliationsFinalisees>0 ? `\n\n👋 ${nbResiliationsFinalisees} résiliation(s) finalisée(s) (dernier mois dû traité) → "Inactif" : ${consultantsResiliationsFinalisees.join(", ")}` : "");
     if(nbIgnores>0){
       messageFinal += "\n\nDétail des entrées ignorées :\n" + detailIgnores.join("\n");
     }
@@ -3507,8 +3524,13 @@ document.getElementById("btnReinitLettres").addEventListener("click", async () =
 // Annule automatiquement toute lettre À faire/En cours dont le consultant est Inactif ou
 // Inactif technique — filet de sécurité passif, appelé à chaque connexion/réinitialisation/
 // rechargement, sans action manuelle à retenir.
+// ⚠️ "Résiliation demandée" est volontairement EXCLU de ce nettoyage : le mois en cours reste
+// dû (CGV Article 7), sa lettre ne doit jamais être annulée automatiquement ici.
 async function nettoyerLettresOrphelines(){
-  const idsInactifs = new Set(files.consultants.rows.filter(c => normalize(c.STATUT_CLIENT) !== "actif").map(c => c.ID));
+  const idsInactifs = new Set(files.consultants.rows.filter(c => {
+    const s = normalize(c.STATUT_CLIENT);
+    return s !== "actif" && s !== normalize("Résiliation demandée");
+  }).map(c => c.ID));
   const orphelines = files.lettres.rows.filter(r => idsInactifs.has(r.ID_CONSULTANT) && (r.STATUT === "À faire" || r.STATUT === "En cours"));
   if(orphelines.length === 0) return 0;
   orphelines.forEach(r => { r.STATUT = "Annulé"; });
@@ -4481,7 +4503,11 @@ function ouvrirEditionClient(id){
   if(!c) return;
   clientEnEdition = c;
   document.getElementById("editClientId").textContent = "ID : " + c.ID;
-  document.getElementById("editStatut").value = normalize(c.STATUT_CLIENT)==="actif" ? "Actif" : (normalize(c.STATUT_CLIENT)==="inactif technique" ? "Inactif technique" : "Inactif");
+  const statutNormalise = normalize(c.STATUT_CLIENT);
+  document.getElementById("editStatut").value =
+    statutNormalise === "actif" ? "Actif" :
+    statutNormalise === normalize("Résiliation demandée") ? "Résiliation demandée" :
+    statutNormalise === "inactif technique" ? "Inactif technique" : "Inactif";
   document.getElementById("editPrenom").value = c["PRÉNOM"] || "";
   document.getElementById("editNom").value = c.NOM || "";
   document.getElementById("editDateNaissance").value = c.DATE_NAISSANCE || "";
