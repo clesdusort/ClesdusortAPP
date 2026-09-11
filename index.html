@@ -315,7 +315,7 @@
     <h2>Base clients</h2>
     <input type="text" id="clientsRecherche" placeholder="Rechercher un nom, un email, une ville...">
     <table class="list">
-      <thead><tr><th>Statut</th><th>Consultant</th><th>Ville</th><th>Email</th><th>Prestations</th><th></th></tr></thead>
+      <thead><tr><th>Statut</th><th>Motif</th><th>Consultant</th><th>Ville</th><th>Email</th><th>Prestations</th><th></th></tr></thead>
       <tbody id="clientsTableBody"></tbody>
     </table>
     <button class="secondary" id="btnBackHomeClients" style="margin-top:16px;">← Retour</button>
@@ -1060,6 +1060,13 @@ async function chargerTousLesCsv(){
     cons.headers.splice(cons.headers.indexOf("ADRESSE_POSTALE_VILLE")+1, 0, "ADRESSE_POSTALE_PAYS");
     cons.rows.forEach(r => { if(r.ADRESSE_POSTALE_PAYS === undefined) r.ADRESSE_POSTALE_PAYS = "France"; });
   }
+  // Trace pourquoi un consultant est passé à "Inactif" (échecs de paiement, résiliation
+  // client, ou vide si désactivé manuellement pour une autre raison) — utile pour distinguer
+  // un désabonnement volontaire d'une perte accidentelle, sans avoir à rouvrir l'historique.
+  if(!cons.headers.includes("MOTIF_INACTIVATION")){
+    cons.headers.push("MOTIF_INACTIVATION");
+    cons.rows.forEach(r => { if(r.MOTIF_INACTIVATION === undefined) r.MOTIF_INACTIVATION = ""; });
+  }
   // Cadeau récurrent pour un tiers : si le client a répondu "Oui" à "S'agit-il d'un cadeau pour
   // quelqu'un d'autre ?" dans le formulaire, ces coordonnées sont conservées sur la fiche
   // consultant elle-même (pas seulement sur une lettre) car la Guidance Mensuelle est récurrente
@@ -1258,6 +1265,20 @@ async function verifierBasculeInactifTechnique(consultantId){
   const resteEnCours = files.lettres.rows.some(r => r.ID_CONSULTANT === consultantId && (r.STATUT === "À faire" || r.STATUT === "En cours"));
   if(resteEnCours) return;
   c.STATUT_CLIENT = "Inactif technique";
+  await writeCsvFile("consultants.csv", files.consultants.headers, files.consultants.rows);
+}
+
+// Bascule automatique "Résiliation demandée" -> "Inactif" dès que la dernière lettre due
+// (celle du mois en cours, déjà payée AVANT la demande de résiliation, donc déjà "À faire"
+// au moment où le statut a été changé) passe à "Terminée" ou "Envoyée". Couvre le cas où le
+// paiement était confirmé avant même que la cliente ne prévienne (pas de nouvel import de
+// paiement à attendre pour finaliser sa désactivation).
+async function verifierFinalisationResiliation(consultantId){
+  const c = files.consultants.rows.find(c => c.ID === consultantId);
+  if(!c || normalize(c.STATUT_CLIENT) !== normalize("Résiliation demandée")) return;
+  c.STATUT_CLIENT = "Inactif";
+  if(!c.DATE_DÉSINSCRIPTION) c.DATE_DÉSINSCRIPTION = new Date().toLocaleDateString("fr-FR");
+  c.MOTIF_INACTIVATION = "Résiliation cliente — mois déjà payé";
   await writeCsvFile("consultants.csv", files.consultants.headers, files.consultants.rows);
 }
 
@@ -1785,24 +1806,25 @@ async function buildPdfDocAnniversaire(){
   } catch(e){ console.warn("Police 29LT Makina introuvable, police par défaut utilisée.", e); }
 
   function charSpaceCm(trackingValue, sizePt){ return (trackingValue/1000) * sizePt * (2.54/72); }
-  function drawBold(text, x, y, size, maxWidthCm, tracking){
+  function drawBold(text, x, y, size, maxWidthCm, tracking, lineHeightFactor){
     doc.setFont(fontOk ? "makina" : "helvetica", fontOk ? "normal" : "bold");
     doc.setFontSize(size);
     doc.setTextColor(0,0,0);
     doc.setCharSpace(charSpaceCm(tracking===undefined ? -8 : tracking, size));
     const lignes = maxWidthCm ? doc.splitTextToSize(text, maxWidthCm) : [text];
-    doc.text(lignes, x, y, {lineHeightFactor:1.2});
-    if(fontOk){ doc.text(lignes, x+0.02, y, {lineHeightFactor:1.2}); doc.text(lignes, x, y+0.02, {lineHeightFactor:1.2}); }
+    const lhf = lineHeightFactor===undefined ? 1.2 : lineHeightFactor;
+    doc.text(lignes, x, y, {lineHeightFactor:lhf});
+    if(fontOk){ doc.text(lignes, x+0.02, y, {lineHeightFactor:lhf}); doc.text(lignes, x, y+0.02, {lineHeightFactor:lhf}); }
     doc.setCharSpace(0);
     return lignes.length;
   }
-  function drawParagraph(text, x, y, size, maxWidthCm, maxLignes){
+  function drawParagraph(text, x, y, size, maxWidthCm, maxLignes, tracking, lineHeightFactor){
     doc.setFont(fontOk ? "makina" : "helvetica", "normal");
     doc.setFontSize(size);
     doc.setTextColor(0,0,0);
-    doc.setCharSpace(charSpaceCm(-8, size));
+    doc.setCharSpace(charSpaceCm(tracking===undefined ? -8 : tracking, size));
     const lines = doc.splitTextToSize(text||"", maxWidthCm);
-    doc.text(lines.slice(0, maxLignes), x, y, {lineHeightFactor:1.3});
+    doc.text(lines.slice(0, maxLignes), x, y, {lineHeightFactor: lineHeightFactor===undefined ? 1.3 : lineHeightFactor});
     doc.setCharSpace(0);
     return Math.min(lines.length, maxLignes);
   }
@@ -1810,14 +1832,16 @@ async function buildPdfDocAnniversaire(){
     return nbLignes * sizePt * interligne / 72 * 2.54;
   }
 
-  // Gabarit : mêmes dimensions de zone de texte que le format 3 cartes (5,9 x 11,4cm), mais
-  // des images de carte plus petites (2 ou 4 par section au lieu d'1 par bande).
+  // Gabarit officiel Anniversaire (coté par Ez, cf. Gabarit_Guidance_Anniv_pdf.pdf) :
+  // - 3 bandes fixes de 9cm (Énergies / Défis / Grandes étapes), zone de texte 11,5cm
+  // - cartes 2,7cm (largeur) x 3,7cm (hauteur), 0,4cm d'écart entre les 2 cartes d'une section
+  // - chiffre au-dessus de chaque carte : taille 17, gras, 0,3cm au-dessus de la carte
   const pageW = 21, pageH = 29.7;
   const marginLeft = 1.0, marginRight = 1.0;
   const contentW = pageW - marginLeft - marginRight;
-  const txtW = 11.4;
-  const cardW = 3.2, cardH = cardW * (7.4/5.3);       // cartes Énergies/Défis (2 par section)
-  const cardW4 = cardW, cardH4 = cardH;    // cartes Étapes : même taille que JJ/MM, comme demandé
+  const txtW = 11.5;
+  const cardW = 2.7, cardH = 3.7;      // cartes Énergies/Défis (2 par section)
+  const cardW4 = cardW, cardH4 = cardH; // cartes Étapes : même taille
 
   const dn = currentConsultant ? currentConsultant.DATE_NAISSANCE : "";
   const [jj,mm,aaaa] = (dn||"//").split("/");
@@ -1832,17 +1856,23 @@ async function buildPdfDocAnniversaire(){
     ? `${document.getElementById("destPrenom").value.trim()} ${document.getElementById("destNom").value.trim()}`.trim()
     : (currentConsultant ? currentConsultant["PRÉNOM NOM"] : "");
   const now2 = new Date();
-  function dessinerEntete(){
+  // Ligne de séparation sous l'en-tête ET point de départ du contenu : y=1,53cm exactement
+  // (mesuré dans le PDF vectoriel du gabarit, pas estimé).
+  const contentStartY = 1.53;
+  function dessinerEntete(avecTitre){
+    if(avecTitre){
+      drawBold("Joyeux anniversaire !", marginLeft, 1.3, 16, undefined, -20);
+    }
     if(nomPourEntete){
       doc.setFont(fontOk ? "makina" : "helvetica", "normal");
       doc.setFontSize(8);
       doc.setTextColor(140,140,140);
-      doc.text(`${nomPourEntete} — ${MOIS_FR[now2.getMonth()]} ${now2.getFullYear()}`, marginLeft, 1.3);
+      doc.text(`${nomPourEntete} — ${MOIS_FR[now2.getMonth()]} ${now2.getFullYear()}`, pageW-marginRight, 1.3, {align:"right"});
       doc.setTextColor(0,0,0);
     }
     doc.setDrawColor(220,220,220);
     doc.setLineWidth(0.02);
-    doc.line(marginLeft, 1.6, pageW-marginRight, 1.6);
+    doc.line(marginLeft, contentStartY, pageW-marginRight, contentStartY);
   }
 
   // Le 1er trimestre démarre au mois du PROCHAIN anniversaire du consultant (pas le mois de
@@ -1865,96 +1895,140 @@ async function buildPdfDocAnniversaire(){
   // Texte fixe (noir dans le gabarit = ne change jamais)
   const introEtapes = "Découvre les énergies majeures qui rythmeront ton nouveau cycle, les opportunités qui pourront se présenter à toi et les enseignements que chaque période t'invitera à accueillir.";
 
-  async function dessinerCarte(cle, cx, cy, w, h){
+  async function dessinerCarte(cle, cx, digitBaselineY, w, h, gap){
+    // digitBaselineY = position du chiffre (taille 17, gras, centré sur la largeur de la carte) ;
+    // 0,3cm d'écart entre le bas du chiffre et le haut de la carte.
     const chiffre = chiffres[cle];
     doc.setFont(fontOk ? "makina" : "helvetica", fontOk ? "normal" : "bold");
-    doc.setFontSize(14);
+    doc.setFontSize(17);
     doc.setTextColor(0,0,0);
-    doc.setCharSpace(charSpaceCm(-8, 14));
-    doc.text(chiffre, cx + w/2, cy, {align:"center"});
-    if(fontOk){ doc.text(chiffre, cx+w/2+0.02, cy, {align:"center"}); doc.text(chiffre, cx+w/2, cy+0.02, {align:"center"}); }
+    doc.setCharSpace(charSpaceCm(-48, 17));
+    doc.text(chiffre, cx + w/2, digitBaselineY, {align:"center"});
+    if(fontOk){ doc.text(chiffre, cx+w/2+0.02, digitBaselineY, {align:"center"}); doc.text(chiffre, cx+w/2, digitBaselineY+0.02, {align:"center"}); }
     doc.setCharSpace(0);
+    const cardTop = digitBaselineY + (gap===undefined ? 0.3 : gap);
     const carte = currentCards[cle] && currentCards[cle].carte;
     if(carte){
       try{
         const img = await loadCardImageBase64(carte);
-        doc.addImage(img, "PNG", cx, cy+0.35, w, h);
-        return;
+        doc.addImage(img, "PNG", cx, cardTop, w, h);
+        return cardTop;
       } catch(e){ console.warn("Image carte introuvable :", carte, e); }
     }
     doc.setDrawColor(180);
-    doc.rect(cx, cy+0.35, w, h);
+    doc.rect(cx, cardTop, w, h);
+    return cardTop;
   }
 
-  // Titre resserré contre le texte (pas de saut de ligne), texte en 11pt/interligne 1.3, et
-  // cartes centrées verticalement sur la hauteur totale du bloc titre+texte.
-  const sectionH = 9; // même hauteur de bande fixe que le générateur Mensuelle (bandH)
-  const cardsBlockW = cardW*2 + 0.3;
-  async function dessinerSectionDeuxCartes(y, titre, texte, cles, cartesAGauche){
-    // Mêmes écarts que le générateur Mensuelle : 0,4cm entre la zone de texte et la zone de
-    // carte(s), et 0,4cm entre la zone de carte(s) et le bord de la bande.
+  // Titre resserré contre le texte (pas de saut de ligne), paragraphe en 11pt/interligne 1.3,
+  // chiffre et carte positionnés d'après les coordonnées vectorielles mesurées dans le gabarit
+  // PDF (Gabarit_Guidance_Anniv_pdf.pdf), avec 0,4cm d'écart entre les 2 cartes d'une section.
+  const sectionH = 9; // même hauteur de bande fixe que le générateur Mensuelle (bandH) — bandes
+                       // strictement contiguës, sans écart, comme buildPdfDoc().
+  const cardGap = 0.4;
+  const cardsBlockW = cardW*2 + cardGap;
+  async function dessinerSectionDeuxCartes(y, titre, texte, cles, cartesAGauche, decalageChiffreCarte){
     const texteX = cartesAGauche ? marginLeft + contentW - txtW - 0.4 : marginLeft + 0.4;
     const carteX0 = cartesAGauche ? marginLeft + 0.4 : marginLeft + contentW - cardsBlockW - 0.4;
 
-    const nbLignesTitre = drawBold(titre, texteX, y + 1.0, 17, txtW, -30);
-    const yTexte = y + 1.0 + Math.max(0, nbLignesTitre-1) * hauteurLignes(1, 17, 1.2) + 0.45;
-    drawParagraph(texte, texteX, yTexte, 11, txtW, 12);
+    // Interligne resserré (0,85 pour le titre, 1,15 pour le paragraphe) et 0,7cm d'espace entre
+    // les deux — uniquement pour ces titres/paragraphes Énergies/Défis.
+    // Le titre a le droit d'utiliser TOUTE la largeur disponible jusqu'au bord de page (ou
+    // jusqu'à la zone des cartes), pas seulement la largeur du paragraphe (11,5cm) — pour que
+    // "Les défis à relever pendant ce nouveau cycle" tienne sur une seule ligne.
+    const maxTitleW = cartesAGauche
+      ? (pageW - marginRight) - texteX
+      : (carteX0 - 0.4) - texteX;
+    const nbLignesTitre = drawBold(titre, texteX, y + 1.0, 17, maxTitleW, -60, 0.85);
+    const yTexte = y + 1.0 + Math.max(0, nbLignesTitre-1) * hauteurLignes(1, 17, 0.85) + 0.7;
+    drawParagraph(texte, texteX, yTexte, 12, txtW, 12, 0, 1.15);
 
-    // Cartes centrées sur toute la hauteur de la bande (comme l'image du générateur Mensuelle),
-    // pas sur la hauteur du texte.
-    const yCartes = y + (sectionH - cardH)/2;
+    const digitY = y + 1.9 + (decalageChiffreCarte || 0); // position du chiffre (baseline)
     for(let i=0;i<2;i++){
-      await dessinerCarte(cles[i], carteX0 + i*(cardW+0.3), yCartes, cardW, cardH);
+      await dessinerCarte(cles[i], carteX0 + i*(cardW+cardGap), digitY, cardW, cardH, 0.3);
     }
     return y + sectionH;
   }
 
+  // Ligne de séparation fine dessinée exactement à la frontière entre deux bandes, sans espace
+  // supplémentaire consommé (comme buildPdfDoc() : bandes strictement adjacentes).
   function traitSeparation(y){
     doc.setDrawColor(220,220,220);
     doc.setLineWidth(0.02);
     doc.line(marginLeft, y, pageW-marginRight, y);
-    return y + 0.6;
+    return y;
   }
 
-  // ---- RECTO : Énergies + Défis uniquement ----
-  dessinerEntete();
-  let y = 2.3;
-  y = await dessinerSectionDeuxCartes(y, "Les énergies qui vont t'accompagner pendant ce nouveau cycle", currentTextes.energies, ["jj1","jj2"], false);
-  y = traitSeparation(y);
-  await dessinerSectionDeuxCartes(y, "Les défis à relever pendant ce nouveau cycle", currentTextes.defis, ["mm1","mm2"], true);
+  // Bloc "Les grandes étapes de ce nouveau cycle" (titre + intro + 4 cartes trimestre + dates).
+  // Rangée des 4 cartes : 2,7cm chacune, 2cm d'écart entre elles, 2,2cm de marge depuis le bord
+  // gauche de la PAGE (pas de la zone de contenu) et 2,1cm depuis le bord droit — cotes données
+  // par Ez (16,8cm de cartes+écarts + 2,2 + 2,1 = 21cm = largeur de la page).
+  async function dessinerGrandesEtapes(y){
+    // Même décalage séparateur→titre que Énergies/Défis (1,0cm), pour que ce soit identique partout.
+    drawBold("Les grandes étapes de ce nouveau cycle", marginLeft, y+1.0, 17, contentW, -48);
+    drawParagraph(introEtapes, marginLeft, y+1.7, 11, contentW, 3, 0, 1.15);
+    const yCartesEtapes = y + 3.0; // resserré : moins d'écart entre le texte et les cartes
+    const startX = 2.2; // depuis le bord gauche de la page
+    const clesEtapes = ["aaaa1","aaaa2","aaaa3","aaaa4"];
+    for(let i=0;i<4;i++){
+      const cx = startX + i*(cardW4+2.0);
+      const cardTop = await dessinerCarte(clesEtapes[i], cx, yCartesEtapes, cardW4, cardH4, 0.3);
+      doc.setFont(fontOk ? "makina" : "helvetica", fontOk ? "normal" : "bold");
+      doc.setFontSize(9);
+      doc.setTextColor(0,0,0);
+      doc.text(`${i+1}${i===0?"er":"ième"} trimestre`, cx+cardW4/2, cardTop+cardH4+0.5, {align:"center"});
+      doc.setFontSize(7);
+      const lignesDate = doc.splitTextToSize(trimestres[i], cardW4+1.5);
+      doc.text(lignesDate, cx+cardW4/2, cardTop+cardH4+0.9, {align:"center", lineHeightFactor:1.2});
+    }
+    return yCartesEtapes;
+  }
 
-  // ---- VERSO : Grandes étapes (4 cartes) + les 4 interprétations à la suite ----
+  // ---- RECTO : Énergies + Défis + Grandes étapes, toutes sur une seule page ----
+  dessinerEntete(true);
+  let y = contentStartY;
+  y = await dessinerSectionDeuxCartes(y, "Les énergies qui vont t'accompagner pendant ce nouveau cycle", currentTextes.energies, ["jj1","jj2"], false, 0.7);
+  y = traitSeparation(y);
+  y = await dessinerSectionDeuxCartes(y, "Les défis à relever pendant ce nouveau cycle", currentTextes.defis, ["mm1","mm2"], true, 0.4);
+  y = traitSeparation(y);
+  await dessinerGrandesEtapes(y);
+  traitSeparation(y + sectionH); // ligne de fermeture en bas de la bande "Grandes étapes"
+
+  // ---- VERSO : uniquement les 4 interprétations trimestrielles, dans une bande de 9cm collée
+  // en bas de page (pour tomber au dos des 4 cartes "grandes étapes" du recto une fois la
+  // feuille imprimée en recto-verso). Pas de titre, pas d'en-tête, pas de répétition du recto. ----
   doc.addPage();
-  dessinerEntete();
-  y = 2.3;
-  drawBold("Les grandes étapes de ce nouveau cycle", marginLeft, y, 17, contentW);
-  drawParagraph(introEtapes, marginLeft, y+0.9, 11, contentW, 3);
-  const yCartesEtapes = y + 2.4;
-  const totalCartesW = 4*cardW4 + 3*0.4;
-  const startX = marginLeft + (contentW - totalCartesW)/2;
-  const clesEtapes = ["aaaa1","aaaa2","aaaa3","aaaa4"];
-  for(let i=0;i<4;i++){
-    const cx = startX + i*(cardW4+0.4);
-    await dessinerCarte(clesEtapes[i], cx, yCartesEtapes, cardW4, cardH4);
-    doc.setFont(fontOk ? "makina" : "helvetica", fontOk ? "normal" : "bold");
-    doc.setFontSize(9);
-    doc.setTextColor(0,0,0);
-    doc.text(`${i+1}${i===0?"er":"ième"} trimestre`, cx+cardW4/2, yCartesEtapes+0.35+cardH4+0.5, {align:"center"});
-    doc.setFont(fontOk ? "makina" : "helvetica", "normal");
-    doc.setFontSize(8);
-    const lignesDate = doc.splitTextToSize(trimestres[i], cardW4+0.3);
-    doc.text(lignesDate, cx+cardW4/2, yCartesEtapes+0.35+cardH4+0.9, {align:"center", lineHeightFactor:1.2});
-  }
-  y = yCartesEtapes + 0.35 + cardH4 + 1.7;
-  y = traitSeparation(y);
+  dessinerEntete(false);
+  traitSeparation(contentStartY + 2*sectionH);     // ligne du haut de la bande (= même que le recto)
+  traitSeparation(contentStartY + 3*sectionH);     // ligne du bas de la bande (= même que le recto)
+
+  const versoZoneW = 18.4; // marges 1,4cm gauche/droite (mesuré : 1,41cm/1,21cm, arrondi)
+  const versoX = 1.4;
+  // Le bloc des 4 interprétations occupe exactement la même bande que "Grandes étapes" au
+  // recto (y=19,58 à 28,58cm mesuré dans le gabarit) : c'est la 3e bande de 9cm, celle qui se
+  // retrouve au dos des 4 cartes trimestre une fois la feuille imprimée en recto-verso.
+  const versoStackTop = contentStartY + 2*sectionH;
+  const versoTextH = 1.8, versoGap = 0.36; // 0,3-0,37cm mesurés ; 0,36cm uniforme = exactement 9cm au total
+  const versoFontSize = 9.5; // à 11pt, seules ~3 lignes (donc ~285 car.) rentrent dans 1,8cm — trop
+  // court pour les 390 caractères max demandés, et le débordement écrasait les écarts suivants.
+  // À 9,5pt, 4 lignes tiennent dans 1,8cm, largement de quoi accueillir 390 caractères sans déborder.
+  const maxLignesVerso = Math.floor(versoTextH / hauteurLignes(1, versoFontSize, 1.3));
 
   doc.setFont(fontOk ? "makina" : "helvetica", "normal");
-  doc.setFontSize(11);
+  doc.setFontSize(versoFontSize);
   doc.setTextColor(0,0,0);
-  [currentTextes.trim1, currentTextes.trim2, currentTextes.trim3, currentTextes.trim4].forEach(txt => {
-    if(!txt) return;
-    const nbLignes = drawParagraph(txt, marginLeft, y, 11, txtW, 5);
-    y += hauteurLignes(nbLignes, 11, 1.3) + 0.2;
+  // Centrage vertical du bloc entier (et non plus ancré en haut avec un écart fixe) : on mesure
+  // d'abord la hauteur réelle de chaque texte, pour répartir l'espace restant également en haut
+  // et en bas de la bande — évite l'asymétrie observée quand le texte ne remplit pas tout son slot.
+  const versoTexts = [currentTextes.trim1, currentTextes.trim2, currentTextes.trim3, currentTextes.trim4];
+  const versoLineH = hauteurLignes(1, versoFontSize, 1.3);
+  const versoLineCounts = versoTexts.map(txt => txt ? Math.min(doc.splitTextToSize(txt, versoZoneW).length, maxLignesVerso) : 0);
+  const totalTextH = versoLineCounts.reduce((sum, n) => sum + n*versoLineH, 0);
+  const totalContentH = totalTextH + 3*versoGap; // 3 écarts entre les 4 blocs
+  let yVerso = versoStackTop + (sectionH - totalContentH)/2 + versoLineH*0.8;
+  versoTexts.forEach((txt, i) => {
+    if(txt) drawParagraph(txt, versoX, yVerso, versoFontSize, versoZoneW, maxLignesVerso, 0);
+    yVerso += versoLineCounts[i]*versoLineH + versoGap;
   });
 
   return doc;
@@ -2010,6 +2084,7 @@ document.getElementById("btnSavePdf").addEventListener("click", async () => {
   row.ANNÉE = anneeActuelle2;
   row.DATE_GENERATION = now2.toLocaleDateString("fr-FR");
   row.STATUT = "Terminée";
+  await verifierFinalisationResiliation(currentConsultant.ID);
   const tarifSaisi = document.getElementById("tarifApplique") ? document.getElementById("tarifApplique").value : "";
   row.TARIF_APPLIQUÉ = tarifSaisi !== "" ? tarifSaisi : (tarifRow ? String(tarifRow.TARIF_BASE).replace(",",".") : "");
   row.CARTES_TIRÉES = cartesListe;
@@ -2541,6 +2616,7 @@ document.getElementById("btnImportPaiements").addEventListener("click", async ()
           if(c && normalize(c.STATUT_CLIENT) === normalize("Actif") && troisEchecsConsecutifs(c.ID)){
             c.STATUT_CLIENT = "Inactif";
             if(!c.DATE_DÉSINSCRIPTION) c.DATE_DÉSINSCRIPTION = new Date().toLocaleDateString("fr-FR");
+            c.MOTIF_INACTIVATION = "3 échecs de paiement consécutifs";
             nbDesactives++;
             consultantsDesactives.push(c["PRÉNOM NOM"] || c.ID);
           }
@@ -2552,6 +2628,7 @@ document.getElementById("btnImportPaiements").addEventListener("click", async ()
         if(c && normalize(c.STATUT_CLIENT) === normalize("Résiliation demandée")){
           c.STATUT_CLIENT = "Inactif";
           if(!c.DATE_DÉSINSCRIPTION) c.DATE_DÉSINSCRIPTION = new Date().toLocaleDateString("fr-FR");
+          c.MOTIF_INACTIVATION = "Résiliation cliente — dernier prélèvement traité";
           nbResiliationsFinalisees++;
           consultantsResiliationsFinalisees.push(c["PRÉNOM NOM"] || c.ID);
         }
@@ -3671,6 +3748,7 @@ function renderEnvoyerScreen(){
         r.DATE_ENVOI = new Date().toLocaleDateString("fr-FR");
         await writeCsvFile("lettres_mois.csv", files.lettres.headers, files.lettres.rows);
         await verifierBasculeInactifTechnique(r.ID_CONSULTANT);
+        await verifierFinalisationResiliation(r.ID_CONSULTANT);
         renderEnvoyerScreen();
         refreshDashboard();
       }
@@ -4486,12 +4564,13 @@ function renderClientsListe(){
   });
   document.getElementById("clientsTableBody").innerHTML = rows.map(c => `<tr>
     <td><span class="badge ${normalize(c.STATUT_CLIENT)==='actif' ? 'terminee' : 'afaire'}">${c.STATUT_CLIENT}</span></td>
+    <td class="small">${c.MOTIF_INACTIVATION||""}</td>
     <td>${c["PRÉNOM NOM"]}</td>
     <td>${c.ADRESSE_POSTALE_VILLE||""}</td>
     <td>${c.MAIL||""}</td>
     <td>${c.PRESTATIONS_SOUSCRITES||""}</td>
     <td><button class="secondary" data-edit-client="${c.ID}">✏️ Modifier</button></td>
-  </tr>`).join("") || `<tr><td colspan="6" class="small">Aucun consultant trouvé.</td></tr>`;
+  </tr>`).join("") || `<tr><td colspan="7" class="small">Aucun consultant trouvé.</td></tr>`;
 
   document.querySelectorAll("[data-edit-client]").forEach(btn => {
     btn.addEventListener("click", () => ouvrirEditionClient(btn.dataset.editClient));
